@@ -367,20 +367,33 @@ def _to_display_str(v):
 def prep_summary(df, label_cols):
     """Make a dense summary/pivot display-ready:
 
-    * stringify every cell so EVERY column LEFT-aligns (fixes the unreadable,
-      right-aligned/clipped last columns);
+    * LABEL columns are stringified so they LEFT-align (keeps the readable look);
+    * VALUE/count columns (everything else, incl. 'Grand Total') are kept as a
+      nullable-integer dtype so the grid SORTS THEM NUMERICALLY. Descending now
+      gives 151, 74, 22, 17, … instead of the old text order 9, 74, 5, 3, ….
+      As a result numeric columns right-align (Streamlit's default for numbers).
     * append one blank spacer column on the far right and one blank spacer row
       at the bottom — *after* the Grand Total — so the last real column/row is
-      never flush against the grid edge.
+      never flush against the grid edge. The spacer row uses <NA> in the value
+      columns, which renders blank and sorts to the end.
 
     Returns a plain DataFrame; pass it through bold_totals() afterwards for the
     Grand Total styling (the all-blank spacer row/col are never bolded)."""
+    label_cols = label_cols if isinstance(label_cols, list) else [label_cols]
+
     out = df.copy()
-    for c in out.columns:
-        out[c] = out[c].map(_to_display_str)
     out[SPACER_COL] = ""                                   # spacer column (far right)
     blank_row = {c: "" for c in out.columns}
     out = pd.concat([out, pd.DataFrame([blank_row])], ignore_index=True)  # spacer row
+
+    # Coerce per column AFTER the spacer row is in place, so the concat can't
+    # upcast the numeric columns back to text — that upcast is exactly what made
+    # the grid sort 'Grand Total' alphabetically instead of by value.
+    for c in out.columns:
+        if c in label_cols or c == SPACER_COL:
+            out[c] = out[c].map(_to_display_str)           # text  -> left-aligned
+        else:
+            out[c] = pd.to_numeric(out[c], errors="coerce").astype("Int64")  # numeric -> sortable
     return out
 
 
