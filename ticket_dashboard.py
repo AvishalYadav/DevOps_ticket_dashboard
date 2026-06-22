@@ -12,21 +12,15 @@ All transformation logic lives in pure functions at the top so it can be
 unit-tested and so the rules are easy to edit in one place.
 """
 
-import os
-from datetime import date
+from datetime import date, timedelta
 
+import altair as alt
 import pandas as pd
 import streamlit as st
 
 # ----------------------------------------------------------------------------
 # CONFIG — edit these blocks to tune behaviour. Nothing else needs changing.
 # ----------------------------------------------------------------------------
-
-# Default local file to auto-load on startup. If this file exists it loads
-# automatically (just hit Refresh after a new export). Leave the uploader as an
-# override — and when deployed to a server where this path doesn't exist, the
-# app simply falls back to asking for an upload.
-DEFAULT_DATA_PATH = r"C:\Cursor\DevOps\eAppSys_Provider_DM.csv"
 
 # Column headers in your export. Referenced by NAME, so column order can change
 # in the source file without breaking anything.
@@ -170,6 +164,72 @@ def done_mask(frame):
     return state_norm(frame) == STATE_DONE.casefold()
 
 
+def retest_mask_of(frame):
+    """Boolean mask of rows whose State contains the retest/monitor keyword
+    (e.g. 'Retest in progress', 'Retest In Test')."""
+    return state_norm(frame).str.contains(RETEST_KEYWORD, case=False, na=False)
+
+
+def dt_norm(frame, col):
+    """Midnight-normalised datetime64 series for `col` (all-NaT if missing).
+    Uses the same dayfirst convention as the rest of the app so day-first
+    exports (DD/MM/YYYY) parse correctly."""
+    if col and col in frame.columns:
+        return pd.to_datetime(frame[col], errors="coerce", dayfirst=True).dt.normalize()
+    return pd.Series(pd.NaT, index=frame.index, dtype="datetime64[ns]")
+
+
+def _daily_counts(dates_dt, mask, start_ts, end_ts):
+    """Per-day counts (Series indexed by python date) for rows where `mask` is
+    True and the date falls within [start_ts, end_ts] inclusive. NaT-safe."""
+    sel = mask & dates_dt.notna() & (dates_dt >= start_ts) & (dates_dt <= end_ts)
+    return dates_dt[sel].dt.date.value_counts()
+
+
+def build_range_trend(frame, created_col, changed_col, start, end):
+    """Daily time-series with a continuous, zero-filled day axis over
+    [start, end]. Columns: 'Created', 'Set to Monitor', 'Closed'.
+
+    Attribution (current-state snapshot — the most a single-row-per-ticket
+    export supports):
+      * Created        -> Created Date (immutable; accurate).
+      * Set to Monitor -> Changed Date, for rows whose CURRENT State contains
+                          the retest keyword.
+      * Closed         -> Changed Date, for rows whose CURRENT State is Done.
+
+    Caveat: Changed Date reflects the LAST activity on a ticket (a comment or
+    any edit also bumps it), so the two Changed-Date series mean "tickets
+    currently in that state whose last activity fell on that day", not exact
+    state-transition events. The cards in the UI sum these columns, so the
+    chart and the metric totals are guaranteed to agree.
+    """
+    start_ts, end_ts = pd.Timestamp(start), pd.Timestamp(end)
+
+    created_dt = dt_norm(frame, created_col)
+    changed_dt = dt_norm(frame, changed_col)
+    all_rows   = pd.Series(True, index=frame.index)
+
+    trend = pd.DataFrame({
+        "Created":        _daily_counts(created_dt, all_rows,             start_ts, end_ts),
+        "Set to Monitor": _daily_counts(changed_dt, retest_mask_of(frame), start_ts, end_ts),
+        "Closed":         _daily_counts(changed_dt, done_mask(frame),     start_ts, end_ts),
+    })
+
+    full_axis = pd.date_range(start_ts, end_ts, freq="D").date  # no skipped days
+    trend = trend.reindex(full_axis).fillna(0).astype(int)
+    trend.index.name = "Day"
+    return trend
+
+
+def data_date_span(frame, created_col, changed_col, fallback):
+    """Min/max observed date across Created+Changed, used as the default range.
+    Falls back to (fallback, fallback) when no dates are parseable."""
+    span = pd.concat([dt_norm(frame, created_col), dt_norm(frame, changed_col)]).dropna()
+    if span.empty:
+        return fallback, fallback
+    return span.min().date(), span.max().date()
+
+
 def enrich(df):
     """Add the derived columns to a raw tickets dataframe."""
     df = df.copy()
@@ -259,9 +319,206 @@ def build_pivot(df, index, columns):
     return flat
 
 
+def show_table(data, label_cols=(), fill_width=True, max_height=560, min_rows=3):
+    """Render a dataframe/Styler consistently:
+
+    * auto-height so typical tables fit without clicking fullscreen;
+    * wider columns for label/index/'Grand Total' so headers aren't clipped
+      (no more manual drag-to-resize, no truncated 'Grand Tota');
+    * `fill_width=False` for wide pivots makes the grid exactly as wide as its
+      content, which removes the odd blank/'extra empty column' on the right.
+
+    Accepts either a pandas DataFrame or a Styler (from bold_totals)."""
+    frame = data.data if hasattr(data, "data") else data   # underlying df if Styler
+    rows  = max(len(frame), min_rows)
+    height = int(min(38 + (rows + 1) * 35, max_height))     # header + rows, capped
+
+    wide = {str(c) for c in label_cols} | {"Grand Total", "Objects",
+                                           "Iteration Path", "Actual Priority"}
+    cfg = {c: st.column_config.Column(width="medium")
+           for c in frame.columns if str(c) in wide}
+
+    st.dataframe(
+        data,
+        hide_index=True,
+        use_container_width=fill_width,
+        height=height,
+        column_config=cfg or None,
+    )
+
+
+# Header used for the cosmetic blank spacer column appended to summary tables.
+# A couple of spaces keeps the header visually empty while staying unique.
+SPACER_COL = "  "
+
+
+def _to_display_str(v):
+    """Render a cell as a clean display string. Integers lose the '.0', NaNs
+    become blank. Stringifying is what makes st.dataframe LEFT-align a column:
+    the grid right-aligns numeric dtypes by default, which is what clipped the
+    right-hand columns and the Grand Total."""
+    if pd.isna(v):
+        return ""
+    if isinstance(v, float) and float(v).is_integer():
+        return str(int(v))
+    return str(v)
+
+
+def prep_summary(df, label_cols):
+    """Make a dense summary/pivot display-ready:
+
+    * stringify every cell so EVERY column LEFT-aligns (fixes the unreadable,
+      right-aligned/clipped last columns);
+    * append one blank spacer column on the far right and one blank spacer row
+      at the bottom — *after* the Grand Total — so the last real column/row is
+      never flush against the grid edge.
+
+    Returns a plain DataFrame; pass it through bold_totals() afterwards for the
+    Grand Total styling (the all-blank spacer row/col are never bolded)."""
+    out = df.copy()
+    for c in out.columns:
+        out[c] = out[c].map(_to_display_str)
+    out[SPACER_COL] = ""                                   # spacer column (far right)
+    blank_row = {c: "" for c in out.columns}
+    out = pd.concat([out, pd.DataFrame([blank_row])], ignore_index=True)  # spacer row
+    return out
+
+
+def count_bar(frame, col, title, color):
+    """Horizontal bar chart of ticket count per value in `col`, biggest first.
+    Horizontal bars keep long Assignee/State labels readable. Driven by the
+    same filtered frame as the table above it, so the two always agree."""
+    if col not in frame.columns or frame.empty:
+        st.info(f"No data for {title}.")
+        return
+    counts = (
+        frame[col].fillna("(blank)").astype(str)
+        .value_counts().rename_axis(col).reset_index(name="Tickets")
+    )
+    chart = (
+        alt.Chart(counts)
+        .mark_bar(color=color)
+        .encode(
+            x=alt.X("Tickets:Q", title="Tickets"),
+            y=alt.Y(f"{col}:N", sort="-x", title=col),
+            tooltip=[alt.Tooltip(f"{col}:N", title=col),
+                     alt.Tooltip("Tickets:Q", title="Tickets")],
+        )
+        .properties(height=max(220, 26 * len(counts)), title=title)
+    )
+    st.altair_chart(chart, use_container_width=True)
+
+
 # ----------------------------------------------------------------------------
 # STREAMLIT UI
 # ----------------------------------------------------------------------------
+
+# Colours shared by the range chart (Created=blue, Monitor=amber, Closed=green —
+# matching the 🆕 / 🔁 / ✅ snapshot metrics above).
+TREND_COLOURS = {"Created": "#2563eb", "Set to Monitor": "#f59e0b", "Closed": "#16a34a"}
+
+
+def render_range_tab(df_full, created_col, changed_col,
+                     default_start, default_end, range_min, range_max,
+                     sel_assignee, sel_iteration, sel_objects):
+    """Date-range view: pick a start/end, see Created / Set-to-Monitor / Closed
+    totals for the window, and a daily point-line trend of all three."""
+    st.subheader("Created · Set to Monitor · Closed over a date range")
+    st.caption(
+        "Created uses **Created Date**; Set to Monitor and Closed use **Changed Date** "
+        "with the ticket's current State. Because any edit (even a comment) updates "
+        "Changed Date, read the two Changed-Date metrics as *“tickets currently in that "
+        "state whose last activity fell in the window”*, not exact transition days."
+    )
+
+    pick, opts = st.columns([1.5, 1])
+    with pick:
+        rng = st.date_input(
+            "Date range (inclusive)",
+            value=(default_start, default_end),
+            min_value=range_min, max_value=range_max,
+            key="range_dates",
+            help="Defaults to the last 30 days up to the reporting date. "
+                 "Scroll the picker back to reach older data in the file.",
+        )
+    with opts:
+        apply_filters = st.checkbox(
+            "Apply sidebar filters",
+            value=False,
+            help="OFF = the whole file (every ticket). ON = restrict this tab to the "
+                 "Assignee / Iteration Path / Objects you've narrowed in the sidebar. "
+                 "The sidebar's State filter is ignored here on purpose, so Done "
+                 "tickets stay visible for the Closed count.",
+        )
+
+    # date_input returns a single date mid-selection; wait for both ends.
+    if not (isinstance(rng, (tuple, list)) and len(rng) == 2):
+        st.info("Pick both a start and an end date to see the range view.")
+        return
+    start, end = rng
+    if start > end:
+        st.warning("Start date is after end date — adjust the range.")
+        return
+
+    base = df_full
+    narrowed = []   # human-readable note of what was actually narrowed
+    if apply_filters:
+        if sel_assignee is not None:
+            base = base[base["Assignee"].astype(str).isin(sel_assignee)]
+            if sel_assignee: narrowed.append(f"{len(sel_assignee)} assignee(s)")
+        if sel_iteration is not None and COL_ITERATION in base.columns:
+            base = base[base[COL_ITERATION].astype(str).isin(sel_iteration)]
+            if sel_iteration: narrowed.append(f"{len(sel_iteration)} iteration(s)")
+        if sel_objects is not None and "Objects" in base.columns:
+            base = base[base["Objects"].astype(str).isin(sel_objects)]
+            if sel_objects: narrowed.append(f"{len(sel_objects)} object(s)")
+
+    trend  = build_range_trend(base, created_col, changed_col, start, end)
+    totals = trend.sum()
+    span   = (end - start).days + 1
+
+    scope = ("filtered → " + ", ".join(narrowed)) if apply_filters else "all tickets in the file"
+    st.caption(f"**{start:%d %b %Y} → {end:%d %b %Y}**  ·  {span} day(s)  ·  {scope}")
+
+    m1, m2, m3 = st.columns(3)
+    m1.metric("🆕 Created in range",        int(totals["Created"]))
+    m2.metric("🔁 Set to Monitor in range", int(totals["Set to Monitor"]))
+    m3.metric("✅ Closed in range",         int(totals["Closed"]))
+
+    # ---- daily point-line chart (3 series) --------------------------------
+    long = trend.reset_index().melt("Day", var_name="Metric", value_name="Count")
+    order = list(TREND_COLOURS.keys())
+    chart = (
+        alt.Chart(long)
+        .mark_line(point=True, strokeWidth=2)
+        .encode(
+            x=alt.X("Day:T", title="Day"),
+            y=alt.Y("Count:Q", title="Tickets", scale=alt.Scale(nice=True, zero=True)),
+            color=alt.Color(
+                "Metric:N",
+                scale=alt.Scale(domain=order, range=[TREND_COLOURS[m] for m in order]),
+                sort=order, title="Metric",
+            ),
+            tooltip=[alt.Tooltip("Day:T", title="Day"),
+                     alt.Tooltip("Metric:N", title="Metric"),
+                     alt.Tooltip("Count:Q", title="Count")],
+        )
+        .properties(height=380)
+    )
+    st.altair_chart(chart, use_container_width=True)
+
+    # ---- supporting daily table + download --------------------------------
+    with st.expander("📋 Daily breakdown table / download"):
+        table = trend.reset_index()
+        table["Day"] = pd.to_datetime(table["Day"]).dt.strftime("%Y-%m-%d")
+        show_table(table, label_cols=["Day"], fill_width=False, max_height=420)
+        st.download_button(
+            "⬇️ Download daily breakdown (CSV)",
+            data=table.to_csv(index=False).encode("utf-8"),
+            file_name=f"ticket_trend_{start:%Y%m%d}_{end:%Y%m%d}.csv",
+            mime="text/csv",
+        )
+
 
 def main():
     st.set_page_config(page_title="Ticket Dashboard", layout="wide")
@@ -284,7 +541,7 @@ def main():
     with st.sidebar:
         st.header("Data source")
         uploaded = st.file_uploader(
-            "Upload a tickets export (overrides the default file)",
+            "Upload a tickets export (CSV or Excel)",
             type=["csv", "xlsx", "xls"],
         )
         st.caption("The derived columns are computed live — no manual prep.")
@@ -297,28 +554,26 @@ def main():
                  "or if the server clock is in a different timezone.",
         )
 
-    # Priority: an uploaded file wins; otherwise auto-load the default path.
-    if uploaded is not None:
-        raw = load_data(uploaded)
-        st.sidebar.success(f"Loaded upload: {uploaded.name}")
-    elif os.path.exists(DEFAULT_DATA_PATH):
-        raw = pd.read_csv(DEFAULT_DATA_PATH)
-        st.sidebar.success(f"Loaded: {os.path.basename(DEFAULT_DATA_PATH)}")
-        st.sidebar.caption("Re-run a fresh export to this path, then hit ↻ Rerun.")
-    else:
+    # The dashboard is upload-driven: nothing renders until a file is provided.
+    # An uploaded file is the only data source — no auto-loaded local path.
+    if uploaded is None:
         st.info(
-            "⬅️ No default file found at the configured path. "
-            "Upload a tickets CSV/Excel in the sidebar to begin."
+            "👋 **Welcome to the Ticket Dashboard.**\n\n"
+            "⬅️ **Upload a tickets export (CSV or Excel) in the sidebar** to see "
+            "the details, metrics and visuals."
         )
         st.stop()
 
+    raw = load_data(uploaded)
+    st.sidebar.success(f"Loaded upload: {uploaded.name}")
+
     today = as_of
 
-    # Full enriched data — keeps 'Done' rows, which are needed ONLY for the
-    # "Closed today" metric. Everything else works off `df` (Done removed).
+    # Full enriched data — keeps 'Done' rows. The overview cards below read this
+    # directly (so 'Closed today' works), and the sidebar filters now operate on
+    # this full frame so 'Done' is a selectable State (just un-ticked by default).
     df_full = enrich(raw)
     is_done_full = done_mask(df_full)
-    df = df_full[~is_done_full].copy()   # active tickets — Done excluded
 
     # ---- Overview metrics (daily snapshot — NOT affected by the filters) ---
     # Resolve the date columns tolerantly (handles 'Changed date', 'ChangedDate', ...)
@@ -377,21 +632,34 @@ def main():
     st.divider()
 
     # ---- Filters ----------------------------------------------------------
+    # Option lists (LOVs) are built from the FULL file, so every value — including
+    # 'Done' — is selectable. Only the State filter pre-excludes 'Done' from its
+    # DEFAULT selection: the active-ticket views stay Done-free out of the box,
+    # but you can tick 'Done' any time to pull those tickets back in.
     with st.sidebar:
         st.header("Filters")
 
-        def multi(label, col):
-            if col not in df.columns:
+        def multi(label, col, exclude_done=False):
+            if col not in df_full.columns:
                 return None
-            opts = sorted(df[col].dropna().astype(str).unique())
-            return st.multiselect(label, opts, default=opts)
+            opts = sorted(df_full[col].dropna().astype(str).unique())
+            if exclude_done:
+                default = [o for o in opts
+                           if o.strip().casefold() != STATE_DONE.casefold()]
+            else:
+                default = opts
+            return st.multiselect(label, opts, default=default)
 
         sel_assignee  = multi("Assignee", "Assignee")
-        sel_state     = multi("State", COL_STATE)
+        sel_state     = multi("State", COL_STATE, exclude_done=True)
         sel_iteration = multi("Iteration Path", COL_ITERATION)
         sel_objects   = multi("Objects", "Objects")
+        st.caption("‘Done’ is available in the State filter but un-ticked by "
+                   "default, so active views stay Done-free unless you add it.")
 
-    f = df.copy()
+    # Filter the FULL file (not a pre-stripped copy) so a ticked 'Done' flows
+    # straight through. With the default selections this equals 'file minus Done'.
+    f = df_full.copy()
     if sel_assignee  is not None: f = f[f["Assignee"].astype(str).isin(sel_assignee)]
     if sel_state     is not None: f = f[f[COL_STATE].astype(str).isin(sel_state)]
     if sel_iteration is not None: f = f[f[COL_ITERATION].astype(str).isin(sel_iteration)]
@@ -410,17 +678,36 @@ def main():
 
     st.divider()
 
-    # ---- Tabbed views (one per Excel pivot) -------------------------------
-    tab_state, tab_iter, tab_assignee, tab_pivot, tab_data = st.tabs(
-        ["By State", "By Iteration Path", "Assignee × State", "Priority × Assignee", "Raw + Download"]
+    # ---- Tabbed views (one per Excel pivot, plus the date-range trend) -----
+    # Default range = the last 30 days up to the reporting date ("today").
+    # Bounds are widened to also cover the file's own date span, so the user can
+    # still scroll the picker back to older data.
+    default_end   = today
+    default_start = today - timedelta(days=29)        # 30 days inclusive
+    data_min, data_max = data_date_span(df_full, created_col, changed_col, today)
+    range_min = min(data_min, default_start)
+    range_max = max(data_max, default_end)
+
+    tab_range, tab_state, tab_iter, tab_assignee, tab_pivot, tab_data = st.tabs(
+        ["📈 Date Range", "By State", "By Iteration Path", "Assignee × State",
+         "Priority × Assignee", "Raw + Download"]
     )
+
+    with tab_range:
+        render_range_tab(
+            df_full, created_col, changed_col,
+            default_start, default_end, range_min, range_max,
+            sel_assignee, sel_iteration, sel_objects,
+        )
 
     with tab_state:
         if COL_STATE in f.columns:
             t = count_table(f, COL_STATE, "State")
             disp = with_grand_total(t, "State")
+            disp = prep_summary(disp, "State")          # left-align + spacer row/col
             left, right = st.columns([1, 1.4])
-            left.dataframe(bold_totals(disp, "State"), hide_index=True, use_container_width=True)
+            with left:
+                show_table(bold_totals(disp, "State"), label_cols=["State"])
             right.bar_chart(t.set_index("State"))  # chart excludes the total row
         else:
             st.warning(f"No '{COL_STATE}' column found.")
@@ -429,8 +716,10 @@ def main():
         if COL_ITERATION in f.columns:
             t = count_table(f, COL_ITERATION, "Iteration Path")
             disp = with_grand_total(t, "Iteration Path")
+            disp = prep_summary(disp, "Iteration Path")   # left-align + spacer row/col
             left, right = st.columns([1, 1.4])
-            left.dataframe(bold_totals(disp, "Iteration Path"), hide_index=True, use_container_width=True)
+            with left:
+                show_table(bold_totals(disp, "Iteration Path"), label_cols=["Iteration Path"])
             right.bar_chart(t.set_index("Iteration Path"))  # chart excludes the total row
         else:
             st.warning(f"No '{COL_ITERATION}' column found.")
@@ -440,7 +729,17 @@ def main():
         st.caption("Each assignee's tickets broken down by state, with Grand Total.")
         if COL_STATE in f.columns:
             piv = build_pivot(f, index="Assignee", columns=COL_STATE)
-            st.dataframe(bold_totals(piv, "Assignee"), hide_index=True, use_container_width=False)
+            piv = prep_summary(piv, "Assignee")          # left-align + spacer row/col
+            show_table(bold_totals(piv, "Assignee"), label_cols=["Assignee"], fill_width=False)
+
+            # ---- Two supporting charts (same filtered data as the table) -----
+            st.markdown("##### Visual summary")
+            st.caption("Tickets per assignee and per state for the current filters.")
+            g1, g2 = st.columns(2)
+            with g1:
+                count_bar(f, "Assignee", "Tickets per Assignee", "#2563eb")
+            with g2:
+                count_bar(f, COL_STATE, "Tickets per State", "#16a34a")
         else:
             st.warning(f"No '{COL_STATE}' column found.")
 
@@ -448,14 +747,15 @@ def main():
         st.subheader("Actual Priority × Object, counted per Assignee")
         st.caption("")
         piv = build_pivot(f, index=["Actual Priority", "Objects"], columns="Assignee")
-        st.dataframe(bold_totals(piv, ["Actual Priority", "Objects"]),
-                     hide_index=True, use_container_width=False)
+        piv = prep_summary(piv, ["Actual Priority", "Objects"])   # left-align + spacer row/col
+        show_table(bold_totals(piv, ["Actual Priority", "Objects"]),
+                   label_cols=["Actual Priority", "Objects"], fill_width=False)
 
     with tab_data:
         st.subheader("Enriched data")
         # 'Assigned To' now holds the clean name, so drop the duplicate helper column
         disp = f.drop(columns=["Assignee"]) if "Assignee" in f.columns else f
-        st.dataframe(disp, use_container_width=True, hide_index=True)
+        show_table(disp, fill_width=False, max_height=600)
         csv_bytes = disp.to_csv(index=False).encode("utf-8")
         st.download_button(
             "⬇️ Download enriched CSV",
