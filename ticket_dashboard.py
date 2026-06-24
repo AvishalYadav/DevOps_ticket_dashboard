@@ -13,10 +13,13 @@ unit-tested and so the rules are easy to edit in one place.
 """
 
 from datetime import date, timedelta
+from html import escape as html_escape
+import json
 
 import altair as alt
 import pandas as pd
 import streamlit as st
+import streamlit.components.v1 as components
 
 # ----------------------------------------------------------------------------
 # CONFIG — edit these blocks to tune behaviour. Nothing else needs changing.
@@ -423,8 +426,320 @@ def count_bar(frame, col, title, color):
 
 
 # ----------------------------------------------------------------------------
+# STATIC SUMMARY-TABLE RENDERER
+# ----------------------------------------------------------------------------
+# The interactive grid (st.dataframe) can't do two things we now need: keep the
+# Grand Total frozen at the bottom while a user sorts, and colour the header row.
+# So the four summary/pivot views render as STATIC styled HTML tables instead —
+# think of an Excel sheet with a coloured header and a totals row that stays put
+# no matter how you sort the rows above it. Because nothing is interactive here,
+# no spacer rows/columns are needed (that hack only existed to coax the grid),
+# which also removes the trailing blank line(s).
+
+TOTAL_LABEL = "Grand Total"
+HEADER_BG   = "#4338ca"   # indigo-700 — prominent, clearly distinct from rows
+HEADER_FG   = "#ffffff"
+TOTAL_FILL  = "#e0e7ff"   # indigo-100 — Grand Total row/column tint
+STRIPE_FILL = "#f8fafc"   # subtle zebra striping for readability
+GRID_LINE   = "#e5e7eb"
+
+
+def _is_total_row(row, label_cols):
+    """A row is the Grand Total row if any label cell equals 'Grand Total'."""
+    return any(str(row[c]).strip() == TOTAL_LABEL for c in label_cols)
+
+
+_TABLE_TEMPLATE = r"""<!DOCTYPE html><html><head><meta charset="utf-8">
+<script src="https://cdnjs.cloudflare.com/ajax/libs/html2canvas/1.4.1/html2canvas.min.js"></script>
+<style>
+  *{box-sizing:border-box;}
+  html,body{margin:0;padding:0;font-family:"Source Sans Pro",system-ui,-apple-system,Segoe UI,sans-serif;}
+  .bar{display:flex;gap:8px;align-items:center;margin:0 0 8px;}
+  .bar button{font:inherit;font-size:0.82rem;font-weight:600;cursor:pointer;
+              border:1px solid var(--grid);background:#fff;color:#312e81;
+              padding:5px 11px;border-radius:7px;}
+  .bar button:hover{background:#eef2ff;border-color:#c7d2fe;}
+  .bar #msg{font-size:0.8rem;color:#16a34a;font-weight:600;}
+  .wrap{overflow:auto;border:1px solid var(--grid);border-radius:8px;}
+  table{border-collapse:separate;border-spacing:0;width:100%;font-size:0.9rem;}
+  th,td{padding:7px 14px;white-space:nowrap;border-bottom:1px solid var(--grid);border-right:1px solid var(--grid);}
+  thead th{position:sticky;top:0;z-index:3;background:var(--hbg);color:var(--hfg);
+           font-weight:700;text-align:right;cursor:pointer;user-select:none;}
+  thead th.label{text-align:left;}
+  thead th.spacer{cursor:default;}
+  thead th:hover:not(.spacer){filter:brightness(1.12);}
+  td.num{text-align:right;color:#1f2937;}
+  td.label{text-align:left;color:#1f2937;font-weight:600;}
+  tbody tr.data td{background:#fff;}
+  tbody tr.data:nth-child(even) td{background:var(--stripe);}
+  th.stick,td.stick{position:sticky;left:0;z-index:2;}
+  thead th.stick{z-index:4;}
+  tbody tr.data td.stick{background:#fff;}
+  tbody tr.data:nth-child(even) td.stick{background:var(--stripe);}
+  tr.total td{background:var(--tfill)!important;font-weight:700;color:#312e81;}
+  td.totalcol{background:var(--tfill)!important;font-weight:700;}
+  tr.spacer td{height:30px;background:#fff;border-bottom:none;}
+  td.spacercol{min-width:42px;background:#fff;}
+  th.spacer{min-width:42px;}
+  .arr{font-size:0.7rem;margin-left:5px;opacity:0.95;}
+  /* During capture: expand fully and drop sticky so the PNG shows every row/column */
+  .cap .wrap{overflow:visible!important;max-height:none!important;}
+  .cap th,.cap td{position:static!important;}
+</style></head><body>
+<div class="bar">
+  <button id="copyBtn">📋 Copy image</button>
+  <button id="pngBtn">⬇ Download PNG</button>
+  <button id="maxBtn">🔳 Max view</button>
+  <span id="msg"></span>
+</div>
+<div class="wrap"><table id="t"><thead><tr id="hr"></tr></thead><tbody id="b"></tbody></table></div>
+<script>
+const P=__PAYLOAD__;
+const R=document.documentElement.style;
+R.setProperty('--hbg',P.headerBg);R.setProperty('--hfg',P.headerFg);
+R.setProperty('--tfill',P.totalFill);R.setProperty('--stripe',P.stripe);R.setProperty('--grid',P.grid);
+const totalColIdx=P.cols.findIndex(c=>c.name===P.totalColName);
+let sortIdx=P.defaultIdx, sortDir='desc';
+function colClass(c,i){let k=c.spacer?'spacercol':(c.label?'label':'num');if(i===0&&c.label)k+=' stick';if(i===totalColIdx)k+=' totalcol';return k;}
+function sortData(){if(sortIdx<0)return;const num=P.cols[sortIdx].sortNum,dir=sortDir==='asc'?1:-1;
+  P.data.sort((ra,rb)=>{let a=ra[sortIdx].k,b=rb[sortIdx].k;
+    if(num){a=(a===null?-Infinity:a);b=(b===null?-Infinity:b);return (a-b)*dir;}
+    a=String(a);b=String(b);return a<b?-dir:a>b?dir:0;});}
+function header(){const hr=document.getElementById('hr');hr.innerHTML='';
+  P.cols.forEach((c,i)=>{const th=document.createElement('th');let cls=c.spacer?'spacer':(c.label?'label':'num');if(i===0&&c.label)cls+=' stick';th.className=cls;
+    th.textContent=c.name;
+    if(i===sortIdx){const s=document.createElement('span');s.className='arr';s.textContent=sortDir==='asc'?'\u25B2':'\u25BC';th.appendChild(s);}
+    if(!c.spacer)th.onclick=()=>{if(sortIdx===i)sortDir=(sortDir==='asc'?'desc':'asc');else{sortIdx=i;sortDir=(c.sortNum?'desc':'asc');}sortData();render();};
+    hr.appendChild(th);});}
+function mkRow(cells,rowCls){const tr=document.createElement('tr');tr.className=rowCls;
+  cells.forEach((cell,i)=>{const td=document.createElement('td');td.className=colClass(P.cols[i],i);td.textContent=cell.t;tr.appendChild(td);});return tr;}
+function render(){header();const b=document.getElementById('b');b.innerHTML='';
+  P.data.forEach(r=>b.appendChild(mkRow(r,'data')));
+  P.totals.forEach(r=>b.appendChild(mkRow(r,'total')));}
+function flash(t,col){const m=document.getElementById('msg');m.style.color=col||'#16a34a';m.textContent=t;setTimeout(()=>{if(m.textContent===t)m.textContent='';},4000);}
+function snap(cb){
+  if(typeof html2canvas==='undefined'){flash('Image tool blocked by network — try the CSV on Raw tab','#b91c1c');return;}
+  document.body.classList.add('cap');
+  const node=document.querySelector('.wrap');
+  html2canvas(node,{backgroundColor:'#ffffff',scale:2,scrollX:0,scrollY:0,
+                    windowWidth:node.scrollWidth,windowHeight:node.scrollHeight})
+    .then(c=>{document.body.classList.remove('cap');cb(c);})
+    .catch(()=>{document.body.classList.remove('cap');flash('Could not render image','#b91c1c');});}
+document.getElementById('copyBtn').onclick=()=>snap(c=>c.toBlob(async b=>{
+  try{await navigator.clipboard.write([new ClipboardItem({'image/png':b})]);
+      flash('Copied! Paste with Ctrl+V');}
+  catch(e){flash('Clipboard blocked — use Download PNG instead','#b91c1c');}},'image/png'));
+document.getElementById('pngBtn').onclick=()=>snap(c=>c.toBlob(b=>{
+  const a=document.createElement('a');a.href=URL.createObjectURL(b);
+  a.download=(P.title||'table')+'.png';a.click();
+  flash('PNG downloaded');},'image/png'));
+document.getElementById('maxBtn').onclick=()=>{
+  const w=window.open('','_blank');
+  if(!w){flash('Pop-up blocked — allow pop-ups, then retry','#b91c1c');return;}
+  // Clone the WHOLE interactive widget so sorting/copy work in the new tab too.
+  let doc='<!DOCTYPE html>'+document.documentElement.outerHTML;
+  doc=doc.replace('</head>','<style>body{padding:18px;}#maxBtn{display:none;}'+
+      '.wrap{max-height:none!important;}</style></head>');
+  w.document.open();w.document.write(doc);w.document.close();
+};
+sortData();render();
+</script></body></html>"""
+
+
+def render_summary_table(df, label_cols, sort_by=None, max_height=720, title="table"):
+    """Render a count/pivot table as an INTERACTIVE, self-contained widget.
+
+    Built as HTML + a little vanilla JS (rendered via st.components.v1.html, so
+    no pip install is needed). It restores the grid features that the static
+    table lost, while keeping the styling the interactive st.dataframe can't do:
+
+      * Coloured, prominent, sticky header (requirement: coloured header).
+      * Click any header to SORT (asc/desc toggle, arrow shown).
+      * First label column and the header are FROZEN/sticky while scrolling.
+      * Grand Total ROW is PINNED at the bottom — excluded from sorting, so it
+        never floats to the top; a Grand Total COLUMN (pivots) is tinted + bold.
+      * Exactly ONE blank spacer row and ONE blank spacer column for clean
+        screenshot framing (nothing clipped at the edges).
+      * Auto-sized height so the whole table shows in one view for screenshots.
+      * `sort_by=False` keeps the given order (Actual Priority 1..n) initially.
+    """
+    label_cols = label_cols if isinstance(label_cols, list) else [label_cols]
+    work = df.copy()
+
+    total_mask = work.apply(lambda r: _is_total_row(r, label_cols), axis=1)
+    totals, body = work[total_mask], work[~total_mask]
+
+    # Initial order: descending by sort column (unless caller keeps order).
+    if sort_by is not False:
+        if sort_by is None:
+            sort_by = (TOTAL_LABEL if TOTAL_LABEL in work.columns
+                       else next((c for c in work.columns if c not in label_cols), None))
+        if sort_by and sort_by in body.columns:
+            body = (body.assign(_s=pd.to_numeric(body[sort_by], errors="coerce"))
+                        .sort_values("_s", ascending=False, kind="stable")
+                        .drop(columns="_s"))
+
+    cols = list(work.columns)
+    value_cols = [c for c in cols if c not in label_cols]
+
+    # A column sorts numerically if every data value parses as a number — this
+    # makes 'Actual Priority' sort 1,2,…,10 instead of as text ("10" before "2").
+    def _numeric_col(col):
+        if col not in label_cols:
+            return True
+        s = pd.to_numeric(body[col], errors="coerce")
+        return len(s) > 0 and bool(s.notna().all())
+    numeric_cols = {c: _numeric_col(c) for c in cols}
+
+    def disp(col, v):
+        if col in label_cols:
+            return "" if pd.isna(v) else str(v)
+        num = pd.to_numeric(pd.Series([v]), errors="coerce").iloc[0]
+        return "" if pd.isna(num) else f"{num:,.0f}"
+
+    def sort_key(col, v):
+        if numeric_cols[col]:
+            num = pd.to_numeric(pd.Series([v]), errors="coerce").iloc[0]
+            return None if pd.isna(num) else float(num)
+        return "" if pd.isna(v) else str(v).lower()
+
+    col_meta = [{"name": str(c), "num": (c not in label_cols),
+                 "label": (c in label_cols), "sortNum": numeric_cols[c]}
+                for c in cols]
+
+    def row_payload(series):
+        return [{"t": disp(c, series[c]), "k": sort_key(c, series[c])} for c in cols]
+
+    data_rows = [row_payload(r) for _, r in body.iterrows()]
+    total_rows = [row_payload(r) for _, r in totals.iterrows()]
+
+    if sort_by is False:
+        default_idx = -1                        # keep priority order, no active sort
+    else:
+        default_idx = cols.index(sort_by) if (sort_by in cols) else -1
+
+    payload = {
+        "cols": col_meta, "data": data_rows, "totals": total_rows,
+        "totalColName": TOTAL_LABEL, "defaultIdx": default_idx, "title": title,
+        "headerBg": HEADER_BG, "headerFg": HEADER_FG,
+        "totalFill": TOTAL_FILL, "stripe": STRIPE_FILL, "grid": GRID_LINE,
+    }
+
+    # Auto height so the full table + toolbar shows in one view.
+    visible_rows = len(data_rows) + len(total_rows)
+    height = min(max_height, 52 + 40 + visible_rows * 34 + 22)   # +40 = screenshot toolbar
+    height = max(height, 190)
+
+    html = _TABLE_TEMPLATE.replace("__PAYLOAD__", json.dumps(payload))
+    components.html(html, height=int(height), scrolling=True)
+
+
+# ----------------------------------------------------------------------------
+# KPI OVERVIEW WIDGET  (the snapshot + filtered KPIs as one copyable image)
+# ----------------------------------------------------------------------------
+_KPI_TEMPLATE = r"""<!DOCTYPE html><html><head><meta charset="utf-8">
+<script src="https://cdnjs.cloudflare.com/ajax/libs/html2canvas/1.4.1/html2canvas.min.js"></script>
+<style>
+ *{box-sizing:border-box;}
+ html,body{margin:0;padding:0;font-family:"Source Sans Pro",system-ui,-apple-system,Segoe UI,sans-serif;}
+ .bar{display:flex;gap:8px;align-items:center;margin:0 0 10px;}
+ .bar button{font:inherit;font-size:0.82rem;font-weight:600;cursor:pointer;border:1px solid #e5e7eb;
+             background:#fff;color:#312e81;padding:5px 11px;border-radius:7px;}
+ .bar button:hover{background:#eef2ff;border-color:#c7d2fe;}
+ .bar #msg{font-size:0.8rem;color:#16a34a;font-weight:600;}
+ .grid{display:grid;grid-template-columns:repeat(4,1fr);gap:12px;}
+ .card{border:1px solid #e5e7eb;border-radius:12px;padding:14px 16px;background:#fff;
+       border-top:4px solid var(--a,#4338ca);box-shadow:0 1px 2px rgba(15,23,42,.04);}
+ .card .lbl{font-size:0.82rem;color:#475569;font-weight:600;margin-bottom:6px;
+            white-space:nowrap;overflow:hidden;text-overflow:ellipsis;}
+ .card .val{font-size:1.9rem;font-weight:800;color:#0f172a;line-height:1;}
+ #cap{background:#fff;}
+ #hd{font-size:0.92rem;color:#334155;font-weight:600;margin:0 0 12px;}
+ #hd b{color:#0f172a;}
+ @media(max-width:760px){.grid{grid-template-columns:repeat(2,1fr);}}
+</style></head><body>
+<div class="bar"><button id="copyBtn">📋 Copy image</button><button id="pngBtn">⬇ Download PNG</button><span id="msg"></span></div>
+<div id="cap"><div id="hd"></div><div class="grid" id="g"></div></div>
+<script>
+const C=__PAYLOAD__;
+if(C.heading){document.getElementById('hd').innerHTML=C.heading;}else{document.getElementById('hd').style.display='none';}
+const g=document.getElementById('g');
+C.cards.forEach(c=>{const d=document.createElement('div');d.className='card';d.style.setProperty('--a',c.accent||'#4338ca');
+ const l=document.createElement('div');l.className='lbl';l.textContent=c.label;if(c.help)l.title=c.help;
+ const v=document.createElement('div');v.className='val';v.textContent=c.value;
+ d.appendChild(l);d.appendChild(v);g.appendChild(d);});
+function flash(t,col){const m=document.getElementById('msg');m.style.color=col||'#16a34a';m.textContent=t;setTimeout(()=>{if(m.textContent===t)m.textContent='';},4000);}
+function snap(cb){if(typeof html2canvas==='undefined'){flash('Image tool blocked by network','#b91c1c');return;}
+ html2canvas(document.getElementById('cap'),{backgroundColor:'#ffffff',scale:2}).then(cb).catch(()=>flash('Could not render image','#b91c1c'));}
+document.getElementById('copyBtn').onclick=()=>snap(c=>c.toBlob(async b=>{try{await navigator.clipboard.write([new ClipboardItem({'image/png':b})]);flash('Copied! Paste with Ctrl+V');}catch(e){flash('Clipboard blocked — use Download PNG','#b91c1c');}},'image/png'));
+document.getElementById('pngBtn').onclick=()=>snap(c=>c.toBlob(b=>{const a=document.createElement('a');a.href=URL.createObjectURL(b);a.download=(C.title||'overview')+'.png';a.click();flash('PNG downloaded');},'image/png'));
+</script></body></html>"""
+
+
+def render_kpi_cards(cards, title="overview", heading=""):
+    """Render KPI cards as a self-contained widget with a Copy-image button. The
+    optional heading (with the snapshot date) sits INSIDE the captured area, so
+    the copied image includes it."""
+    import math
+    payload = {"cards": cards, "title": title, "heading": heading}
+    rows = math.ceil(len(cards) / 4)
+    height = 50 + (28 if heading else 0) + rows * 104 + 14
+    html = _KPI_TEMPLATE.replace("__PAYLOAD__", json.dumps(payload))
+    components.html(html, height=int(height), scrolling=False)
+
+
+# ----------------------------------------------------------------------------
 # STREAMLIT UI
 # ----------------------------------------------------------------------------
+
+def render_welcome():
+    """A visual landing page shown before any file is uploaded."""
+    st.markdown(
+        """
+<div style="margin-top:6px;padding:34px 30px;border-radius:18px;
+     background:linear-gradient(135deg,#4338ca 0%,#6366f1 55%,#0ea5e9 100%);color:#fff;">
+  <div style="font-size:2.3rem;font-weight:800;line-height:1.1;">🎫 Ticket Dashboard</div>
+  <div style="font-size:1.08rem;opacity:.95;margin-top:10px;max-width:760px;">
+    Turn a raw tickets export into an interactive, screenshot-ready report in
+    seconds — trends, pivots, and one-click images.
+  </div>
+  <div style="display:inline-block;margin-top:18px;padding:11px 18px;border-radius:10px;
+       background:rgba(255,255,255,.16);border:1px solid rgba(255,255,255,.45);
+       font-weight:700;font-size:1rem;">
+    ⬅️ Upload a CSV or Excel export in the sidebar to begin
+  </div>
+</div>
+""",
+        unsafe_allow_html=True,
+    )
+
+    cards = [
+        ("📈", "Ticket Trends", "Created · Set to Monitor · Closed over any date range, with toggleable series."),
+        ("📊", "Smart pivots", "Break tickets down by State, Iteration Path, Assignee, and Priority."),
+        ("🎨", "Clear tables", "Coloured headers, click-to-sort, frozen first column, pinned Grand Total."),
+        ("📋", "One-click copy", "Copy any table or the KPI overview as an image — then paste it wherever you need."),
+        ("🔍", "Max view", "Open any table full-screen for easy reading of wide pivots."),
+        ("⬇️", "Clean export", "Download the enriched data as CSV, with derived columns computed for you."),
+    ]
+    cells = "".join(
+        f"""<div style="border:1px solid #e5e7eb;border-radius:14px;padding:16px 18px;background:#fff;">
+              <div style="font-size:1.5rem;">{icon}</div>
+              <div style="font-weight:700;color:#0f172a;margin:6px 0 4px;">{title}</div>
+              <div style="font-size:0.9rem;color:#475569;line-height:1.35;">{desc}</div>
+            </div>"""
+        for icon, title, desc in cards
+    )
+    st.markdown(
+        f"""
+<div style="margin-top:22px;font-weight:700;color:#334155;font-size:1.05rem;">What you'll get</div>
+<div style="display:grid;grid-template-columns:repeat(3,1fr);gap:14px;margin-top:12px;">{cells}</div>
+<div style="margin-top:20px;color:#64748b;font-size:0.88rem;">
+  Accepted files: <b>.csv</b>, <b>.xlsx</b>, <b>.xls</b> &nbsp;·&nbsp;
+  Your file is processed in this session only — nothing is uploaded to a server by the dashboard itself.
+</div>
+""",
+        unsafe_allow_html=True,
+    )
 
 # Colours shared by the range chart (Created=blue, Monitor=amber, Closed=green —
 # matching the 🆕 / 🔁 / ✅ snapshot metrics above).
@@ -436,22 +751,16 @@ def render_range_tab(df_full, created_col, changed_col,
                      sel_assignee, sel_iteration, sel_objects):
     """Date-range view: pick a start/end, see Created / Set-to-Monitor / Closed
     totals for the window, and a daily point-line trend of all three."""
-    st.subheader("Created · Set to Monitor · Closed over a date range")
-    st.caption(
-        "Created uses **Created Date**; Set to Monitor and Closed use **Changed Date** "
-        "with the ticket's current State. Because any edit (even a comment) updates "
-        "Changed Date, read the two Changed-Date metrics as *“tickets currently in that "
-        "state whose last activity fell in the window”*, not exact transition days."
-    )
+    st.subheader("Ticket Trends — Created · Set to Monitor · Closed over a date range")
 
     pick, opts = st.columns([1.5, 1])
     with pick:
         rng = st.date_input(
-            "Date range (inclusive)",
+            "Trend date range (inclusive)",
             value=(default_start, default_end),
             min_value=range_min, max_value=range_max,
             key="range_dates",
-            help="Defaults to the last 30 days up to the reporting date. "
+            help="Defaults to the last 7 days up to the reporting date. "
                  "Scroll the picker back to reach older data in the file.",
         )
     with opts:
@@ -464,6 +773,18 @@ def render_range_tab(df_full, created_col, changed_col,
                  "tickets stay visible for the Closed count.",
         )
 
+    # ---- Series toggles: pick any combination; all three on by default --------
+    st.caption("Show series:")
+    s1, s2, s3 = st.columns(3)
+    show_created = s1.checkbox("🆕 Created",        value=True, key="trend_show_created")
+    show_monitor = s2.checkbox("🔁 Set to Monitor", value=True, key="trend_show_monitor")
+    show_closed  = s3.checkbox("✅ Closed",          value=True, key="trend_show_closed")
+    selected = [name for name, on in (
+        ("Created", show_created),
+        ("Set to Monitor", show_monitor),
+        ("Closed", show_closed),
+    ) if on]
+
     # date_input returns a single date mid-selection; wait for both ends.
     if not (isinstance(rng, (tuple, list)) and len(rng) == 2):
         st.info("Pick both a start and an end date to see the range view.")
@@ -471,6 +792,10 @@ def render_range_tab(df_full, created_col, changed_col,
     start, end = rng
     if start > end:
         st.warning("Start date is after end date — adjust the range.")
+        return
+    if not selected:
+        st.info("Tick at least one series above (Created / Set to Monitor / Closed) "
+                "to see the trend.")
         return
 
     base = df_full
@@ -487,20 +812,25 @@ def render_range_tab(df_full, created_col, changed_col,
             if sel_objects: narrowed.append(f"{len(sel_objects)} object(s)")
 
     trend  = build_range_trend(base, created_col, changed_col, start, end)
+    trend  = trend[selected]                       # honour the series checkboxes
     totals = trend.sum()
     span   = (end - start).days + 1
 
     scope = ("filtered → " + ", ".join(narrowed)) if apply_filters else "all tickets in the file"
     st.caption(f"**{start:%d %b %Y} → {end:%d %b %Y}**  ·  {span} day(s)  ·  {scope}")
 
-    m1, m2, m3 = st.columns(3)
-    m1.metric("🆕 Created in range",        int(totals["Created"]))
-    m2.metric("🔁 Set to Monitor in range", int(totals["Set to Monitor"]))
-    m3.metric("✅ Closed in range",         int(totals["Closed"]))
+    metric_labels = {
+        "Created":        "🆕 Created in range",
+        "Set to Monitor": "🔁 Set to Monitor in range",
+        "Closed":         "✅ Closed in range",
+    }
+    cols = st.columns(len(selected))
+    for col, name in zip(cols, selected):
+        col.metric(metric_labels[name], int(totals[name]))
 
-    # ---- daily point-line chart (3 series) --------------------------------
+    # ---- daily point-line chart (selected series only) --------------------
     long = trend.reset_index().melt("Day", var_name="Metric", value_name="Count")
-    order = list(TREND_COLOURS.keys())
+    order = [m for m in TREND_COLOURS if m in selected]
     chart = (
         alt.Chart(long)
         .mark_line(point=True, strokeWidth=2)
@@ -534,7 +864,7 @@ def render_range_tab(df_full, created_col, changed_col,
 
 
 def main():
-    st.set_page_config(page_title="Ticket Dashboard", layout="wide")
+    st.set_page_config(page_title="Ticket Dashboard · v9", layout="wide")
     # Trim Streamlit's large default top padding and use a compact heading so
     # more of the dashboard is visible without scrolling.
     st.markdown(
@@ -570,11 +900,7 @@ def main():
     # The dashboard is upload-driven: nothing renders until a file is provided.
     # An uploaded file is the only data source — no auto-loaded local path.
     if uploaded is None:
-        st.info(
-            "👋 **Welcome to the Ticket Dashboard.**\n\n"
-            "⬅️ **Upload a tickets export (CSV or Excel) in the sidebar** to see "
-            "the details, metrics and visuals."
-        )
+        render_welcome()
         st.stop()
 
     raw = load_data(uploaded)
@@ -616,33 +942,9 @@ def main():
         st.write(f"Done rows in file: **{int(is_done_full.sum())}**")
         st.write(f"Retest-state rows: **{int(retest_mask.sum())}**")
 
-    st.caption(f"Daily snapshot for **{today:%a %d %b %Y}** "
-               f"(Done excluded everywhere except *Closed today*).")
-    o1, o2, o3, o4 = st.columns(4)
-    o1.metric(
-        "🆕 Created today", new_today,
-        help=(f"Tickets where {created_col} (date only) = {today}."
-              if has_created else "No Created-date column found in this export."),
-    )
-    o2.metric(
-        "🏢 eAppsys tickets", eappsys_cnt,
-        help="Active tickets assigned to the eAppsys team (substring match, so "
-             "trailing identifiers still count). Done excluded.",
-    )
-    o3.metric(
-        "🔁 Set to Monitor today", retest_today,
-        help=(f"State contains '{RETEST_KEYWORD}' (e.g. Retest in progress, Retest In "
-              f"Test) and {changed_col} (date only) = {today}."
-              if has_changed else "No Changed-date column found in this export."),
-    )
-    o4.metric(
-        "✅ Closed today", closed_today,
-        help=(f"State = '{STATE_DONE}' and {changed_col} (date only) = {today}. "
-              "The only metric that includes Done."
-              if has_changed else "No Changed-date column found in this export."),
-    )
-
-    st.divider()
+    # Snapshot KPI values (new_today, eappsys_cnt, retest_today, closed_today) are
+    # computed above. The full overview (snapshot + filtered KPIs) is rendered as
+    # ONE copyable widget after the filters are applied — see below.
 
     # ---- Filters ----------------------------------------------------------
     # Option lists (LOVs) are built from the FULL file, so every value — including
@@ -678,31 +980,45 @@ def main():
     if sel_iteration is not None: f = f[f[COL_ITERATION].astype(str).isin(sel_iteration)]
     if sel_objects   is not None: f = f[f["Objects"].astype(str).isin(sel_objects)]
 
-    # ---- KPIs (filtered view — Done already excluded) ---------------------
-    c1, c2, c3, c4 = st.columns(4)
-    c1.metric("Total tickets", len(f))
-    c2.metric("Total assignees", f["Assignee"].nunique())
-    c3.metric("States", f[COL_STATE].nunique() if COL_STATE in f.columns else 0)
+    # ---- Overview KPIs (snapshot + filtered) as ONE copyable image -------
     if COL_PRIORITY in f.columns:
         p1_count = int((pd.to_numeric(f[COL_PRIORITY], errors="coerce") == 1).sum())
     else:
         p1_count = 0
-    c4.metric("Priority 1 tickets", p1_count, help="Tickets where Priority = 1 (highest)")
+    states_cnt = int(f[COL_STATE].nunique()) if COL_STATE in f.columns else 0
+
+    snapshot_heading = (f"Daily snapshot for <b>{today:%a %d %b %Y}</b> "
+                        f"(Done excluded everywhere except Closed today).")
+    render_kpi_cards([
+        {"label": "🆕 Created today",        "value": int(new_today),    "accent": "#2563eb",
+         "help": "Tickets created on the reporting date."},
+        {"label": "🏢 eAppsys tickets",      "value": int(eappsys_cnt),  "accent": "#7c3aed",
+         "help": "Active tickets assigned to the eAppsys team. Done excluded."},
+        {"label": "🔁 Set to Monitor today", "value": int(retest_today), "accent": "#f59e0b",
+         "help": "Retest-state tickets last changed on the reporting date."},
+        {"label": "✅ Closed today",          "value": int(closed_today), "accent": "#16a34a",
+         "help": "Tickets moved to Done on the reporting date."},
+        {"label": "Total tickets",           "value": int(len(f)),                  "accent": "#0ea5e9"},
+        {"label": "Total assignees",         "value": int(f['Assignee'].nunique()), "accent": "#0891b2"},
+        {"label": "States",                  "value": states_cnt,                   "accent": "#6366f1"},
+        {"label": "Priority 1 tickets",      "value": int(p1_count),                "accent": "#dc2626",
+         "help": "Tickets where Priority = 1 (highest)."},
+    ], title="overview", heading=snapshot_heading)
 
     st.divider()
 
-    # ---- Tabbed views (one per Excel pivot, plus the date-range trend) -----
-    # Default range = the last 30 days up to the reporting date ("today").
+    # ---- Tabbed views (one per Excel pivot, plus the ticket-trends view) ----
+    # Default range = the last 7 days up to the reporting date ("today").
     # Bounds are widened to also cover the file's own date span, so the user can
     # still scroll the picker back to older data.
     default_end   = today
-    default_start = today - timedelta(days=29)        # 30 days inclusive
+    default_start = today - timedelta(days=6)         # 7 days inclusive
     data_min, data_max = data_date_span(df_full, created_col, changed_col, today)
     range_min = min(data_min, default_start)
     range_max = max(data_max, default_end)
 
     tab_range, tab_state, tab_iter, tab_assignee, tab_pivot, tab_data = st.tabs(
-        ["📈 Date Range", "By State", "By Iteration Path", "Assignee × State",
+        ["📈 Ticket Trends", "By State", "By Iteration Path", "Assignee × State",
          "Priority × Assignee", "Raw + Download"]
     )
 
@@ -716,11 +1032,10 @@ def main():
     with tab_state:
         if COL_STATE in f.columns:
             t = count_table(f, COL_STATE, "State")
-            disp = with_grand_total(t, "State")
-            disp = prep_summary(disp, "State")          # left-align + spacer row/col
+            disp = with_grand_total(t, "State")          # Grand Total appended
             left, right = st.columns([1, 1.4])
             with left:
-                show_table(bold_totals(disp, "State"), label_cols=["State"])
+                render_summary_table(disp, label_cols=["State"], title="By_State")  # desc by Count, total pinned
             right.bar_chart(t.set_index("State"))  # chart excludes the total row
         else:
             st.warning(f"No '{COL_STATE}' column found.")
@@ -728,26 +1043,23 @@ def main():
     with tab_iter:
         if COL_ITERATION in f.columns:
             t = count_table(f, COL_ITERATION, "Iteration Path")
-            disp = with_grand_total(t, "Iteration Path")
-            disp = prep_summary(disp, "Iteration Path")   # left-align + spacer row/col
+            disp = with_grand_total(t, "Iteration Path")  # Grand Total appended
             left, right = st.columns([1, 1.4])
             with left:
-                show_table(bold_totals(disp, "Iteration Path"), label_cols=["Iteration Path"])
+                render_summary_table(disp, label_cols=["Iteration Path"], title="By_Iteration_Path")  # desc by Count, total pinned
             right.bar_chart(t.set_index("Iteration Path"))  # chart excludes the total row
         else:
             st.warning(f"No '{COL_ITERATION}' column found.")
 
     with tab_assignee:
         st.subheader("Assignee × State")
-        st.caption("Each assignee's tickets broken down by state, with Grand Total.")
         if COL_STATE in f.columns:
             piv = build_pivot(f, index="Assignee", columns=COL_STATE)
-            piv = prep_summary(piv, "Assignee")          # left-align + spacer row/col
-            show_table(bold_totals(piv, "Assignee"), label_cols=["Assignee"], fill_width=False)
+            # Busiest assignee first (desc by their Grand Total); total row pinned.
+            render_summary_table(piv, label_cols=["Assignee"], title="Assignee_x_State")
 
             # ---- Two supporting charts (same filtered data as the table) -----
             st.markdown("##### Visual summary")
-            st.caption("Tickets per assignee and per state for the current filters.")
             g1, g2 = st.columns(2)
             with g1:
                 count_bar(f, "Assignee", "Tickets per Assignee", "#2563eb")
@@ -758,18 +1070,23 @@ def main():
 
     with tab_pivot:
         st.subheader("Actual Priority × Object, counted per Assignee")
-        st.caption("")
         piv = build_pivot(f, index=["Actual Priority", "Objects"], columns="Assignee")
-        piv = prep_summary(piv, ["Actual Priority", "Objects"])   # left-align + spacer row/col
-        show_table(bold_totals(piv, ["Actual Priority", "Objects"]),
-                   label_cols=["Actual Priority", "Objects"], fill_width=False)
+        # Keep the meaningful priority order (1..10, then unassigned); pin total.
+        render_summary_table(piv, label_cols=["Actual Priority", "Objects"],
+                             sort_by=False, title="Priority_x_Assignee")
 
     with tab_data:
         st.subheader("Enriched data")
         # 'Assigned To' now holds the clean name, so drop the duplicate helper column
         disp = f.drop(columns=["Assignee"]) if "Assignee" in f.columns else f
-        show_table(disp, fill_width=False, max_height=600)
-        csv_bytes = disp.to_csv(index=False).encode("utf-8")
+        csv_bytes = disp.to_csv(index=False).encode("utf-8")   # clean export (no blanks)
+
+        # On-screen only: one blank spacer column + one blank trailing row (framing).
+        view = disp.copy()
+        view[" "] = ""
+        view = pd.concat([view, pd.DataFrame([{c: "" for c in view.columns}])],
+                         ignore_index=True)
+        show_table(view, fill_width=False, max_height=600)
         st.download_button(
             "⬇️ Download enriched CSV",
             data=csv_bytes,
