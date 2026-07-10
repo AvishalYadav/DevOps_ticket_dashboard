@@ -1491,6 +1491,39 @@ def render_pivot_builder(df_full):
 
 
 
+def render_eappsys_tab(f_eappsys):
+    """Assignee × State pivot restricted to the eAppsys team.
+
+    Mirrors the main Assignee × State tab exactly — same active frame logic
+    (Done excluded, created-after-reporting-date excluded) — but pre-filtered
+    to eAppsys team members so the table is focused and the count matches the
+    '🏢 eAppsys tickets' KPI card.
+    """
+    st.subheader("eAppsys Assignee × State")
+    st.caption(
+        f"**{len(f_eappsys):,}** active ticket(s) assigned to the eAppsys team "
+        f"(Done excluded · future-dated excluded · {len(f_eappsys['Assignee'].unique())} assignee(s))."
+    )
+
+    if f_eappsys.empty:
+        st.info("No active eAppsys tickets for the selected reporting date.")
+        return
+
+    if COL_STATE not in f_eappsys.columns:
+        st.warning(f"No '{COL_STATE}' column found.")
+        return
+
+    piv = build_pivot(f_eappsys, index="Assignee", columns=COL_STATE)
+    render_summary_table(piv, label_cols=["Assignee"], title="eAppsys_Assignee_x_State")
+
+    st.markdown("##### Visual summary")
+    g1, g2 = st.columns(2)
+    with g1:
+        count_bar(f_eappsys, "Assignee", "Tickets per eAppsys Assignee", "#7c3aed")
+    with g2:
+        count_bar(f_eappsys, COL_STATE, "Tickets per State (eAppsys)", "#0891b2")
+
+
 def main():
     st.set_page_config(page_title="Ticket Dashboard · v10", layout="wide")
 
@@ -1573,7 +1606,6 @@ def main():
     retest_mask  = state_full.str.contains(RETEST_KEYWORD, case=False, na=False)
 
     new_today    = int((created_full == today).sum())
-    eappsys_cnt  = int((df_full["Assignee"].apply(is_eappsys) & (~is_done_full)).sum())
     retest_today = int((retest_mask & (changed_full == today)).sum())
     closed_today = int((is_done_full & (changed_full == today)).sum())
 
@@ -1602,6 +1634,14 @@ def main():
     created_on_or_before = created_full.isna() | (created_full <= today)
     active_mask = (~is_done_full) & created_on_or_before
     f = df_full[active_mask].copy()
+
+    # ---- eAppsys sub-frame (active tickets assigned to the eAppsys team) ---
+    # Derived from the same date-filtered, Done-excluded frame `f` so the KPI
+    # card and the eAppsys Assignee × State tab always agree with each other
+    # and with "Total tickets".
+    eappsys_mask = f["Assignee"].apply(is_eappsys)
+    f_eappsys    = f[eappsys_mask].copy()
+    eappsys_cnt  = int(len(f_eappsys))
 
     # ---- Overview KPIs (snapshot + active) as ONE copyable image ---------
     if COL_PRIORITY in f.columns:
@@ -1640,8 +1680,14 @@ def main():
     range_min = min(data_min, default_start)
     range_max = max(data_max, default_end)
 
-    tab_range, tab_assignee, tab_pivot, tab_data = st.tabs(
-        ["📈 Ticket Trends", "Assignee × State", "🧮 Pivot Builder", "Raw + Download"]
+    tab_range, tab_pivot, tab_eappsys, tab_assignee, tab_data = st.tabs(
+        [
+            "📈 Ticket Trends",
+            "🧮 Pivot Builder",
+            "🏢 eAppsys Assignee × State",
+            "Assignee × State",
+            "Raw + Download",
+        ]
     )
 
     with tab_range:
@@ -1649,6 +1695,12 @@ def main():
             df_full, created_col, changed_col,
             default_start, default_end, range_min, range_max,
         )
+
+    with tab_pivot:
+        render_pivot_builder(df_full)
+
+    with tab_eappsys:
+        render_eappsys_tab(f_eappsys)
 
     with tab_assignee:
         st.subheader("Assignee × State")
@@ -1666,9 +1718,6 @@ def main():
                 count_bar(f, COL_STATE, "Tickets per State", "#16a34a")
         else:
             st.warning(f"No '{COL_STATE}' column found.")
-
-    with tab_pivot:
-        render_pivot_builder(df_full)
 
     with tab_data:
         st.subheader("Enriched data")
